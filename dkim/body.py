@@ -10,6 +10,22 @@ NotImplementedError。实现必须满足 tests 中的精确契约，不得修改
 - 摘要均为 SHA-256 的小写十六进制字符串。
 """
 
+import hashlib
+import hmac
+import re
+
+
+def _to_bytes(data):
+    if isinstance(data, str):
+        return data.encode("utf-8")
+    return bytes(data)
+
+
+def _split_lines(body):
+    """把正文统一拆成不含行结束符的行列表（CRLF / LF 均按行结束符处理）。"""
+    body = _to_bytes(body).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return body.split(b"\n")
+
 
 def split_headers(raw) -> dict:
     """拆分原始邮件的头部与正文，并还原头部折叠行。
@@ -20,7 +36,38 @@ def split_headers(raw) -> dict:
     前一行还原为同一个值：去掉 CRLF，并把续行前导空白折叠为一个空格，值
     的两端空白应去掉。同名头部不得覆盖，正文必须原样保留。
     """
-    raise NotImplementedError("split_headers")
+    raw = _to_bytes(raw)
+    # 在第一个空行处拆分；正文部分原样保留。
+    pos = raw.find(b"\r\n\r\n")
+    if pos != -1:
+        header_block, body = raw[:pos], raw[pos + 4:]
+    else:
+        pos = raw.find(b"\n\n")
+        if pos != -1:
+            header_block, body = raw[:pos], raw[pos + 2:]
+        else:
+            header_block, body = raw, b""
+
+    headers = {}
+    current_name = None
+    for line in header_block.replace(b"\r\n", b"\n").split(b"\n"):
+        if not line:
+            continue
+        if line[:1] in (b" ", b"\t"):
+            # 续行：去掉折行，前导空白折叠为一个空格。
+            if current_name is not None:
+                continuation = line.decode("utf-8", "replace").strip()
+                if continuation:
+                    headers[current_name][-1] += " " + continuation
+            continue
+        name, sep, value = line.partition(b":")
+        if not sep:
+            continue
+        current_name = name.decode("utf-8", "replace").strip().lower()
+        headers.setdefault(current_name, []).append(
+            value.decode("utf-8", "replace").strip()
+        )
+    return {"headers": headers, "body": body}
 
 
 def canonicalize_body(body, mode) -> bytes:
@@ -33,7 +80,25 @@ def canonicalize_body(body, mode) -> bytes:
     末尾的空行并保证结果以 CRLF 结束，不得执行宽松模式的行尾裁剪。
     两种模式都必须把空正文规范化为 b"\r\n"。
     """
-    raise NotImplementedError("canonicalize_body")
+    if mode not in ("relaxed", "strict"):
+        raise ValueError("unknown canonicalization mode: %r" % (mode,))
+    lines = _split_lines(body)
+    if mode == "relaxed":
+        # 先删行尾空白，末尾空行的判定以裁剪后的行为准。
+        lines = [line.rstrip(b" \t") for line in lines]
+    # 末尾拆分产生的空串即末尾空行，统一先去掉末尾空行。
+    while lines and lines[-1] == b"":
+        lines.pop()
+    if mode == "relaxed":
+        collapsed = []
+        for line in lines:
+            if line == b"" and collapsed and collapsed[-1] == b"":
+                continue
+            collapsed.append(line)
+        lines = collapsed
+    if not lines:
+        return b"\r\n"
+    return b"\r\n".join(lines) + b"\r\n"
 
 
 def apply_length_tag(body, length) -> bytes:
@@ -43,7 +108,13 @@ def apply_length_tag(body, length) -> bytes:
     0 到 len(body)（含两端）；返回 body[:length]。length 为负数、超过正文
     长度或不是整数时必须报 ValueError，不得静默返回空串。
     """
-    raise NotImplementedError("apply_length_tag")
+    if isinstance(length, bool) or not isinstance(length, int):
+        raise ValueError("length must be an integer")
+    body = _to_bytes(body)
+    if length < 0 or length > len(body):
+        raise ValueError("length %r out of range for body of %d bytes"
+                         % (length, len(body)))
+    return body[:length]
 
 
 def body_hash(body, mode, length) -> str:
@@ -53,7 +124,10 @@ def body_hash(body, mode, length) -> str:
     字节计算 SHA-256；length 为 None 表示没有长度标签、不截断。顺序颠倒会
     使截断之后的追加内容改变摘要，必须避免。
     """
-    raise NotImplementedError("body_hash")
+    canonical = canonicalize_body(body, mode)
+    if length is not None:
+        canonical = apply_length_tag(canonical, length)
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def parse_signature(header) -> dict:
@@ -69,7 +143,59 @@ def parse_signature(header) -> dict:
     必须报 ValueError，避免签名头签自身形成循环依赖。缺少 v、a、d、s、h、
     bh、b 或 h 为空时同样报 ValueError。
     """
-    raise NotImplementedError("parse_signature")
+    if isinstance(header, bytes):
+        header = header.decode("utf-8", "replace")
+    # 展开折叠行。
+    header = re.sub(r"\r?\n[ \t]+", " ", header)
+    header = header.strip()
+    if header.lower().startswith("dkim-signature:"):
+        header = header[len("dkim-signature:"):]
+
+    tags = {}
+    for part in header.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        name, sep, value = part.partition("=")
+        if not sep:
+            raise ValueError("malformed tag: %r" % (part,))
+        tags[name.strip().lower()] = value.strip()
+
+    for required in ("v", "a", "d", "s", "h", "bh", "b"):
+        if required not in tags or not tags[required]:
+            raise ValueError("missing required tag: %s" % required)
+
+    headers = [name.strip().lower() for name in tags["h"].split(":")]
+    headers = [name for name in headers if name]
+    if not headers:
+        raise ValueError("empty h tag")
+    if "dkim-signature" in headers:
+        raise ValueError("h tag must not include dkim-signature")
+
+    canonicalization = tags.get("c", "simple/simple") or "simple/simple"
+    modes = canonicalization.split("/", 1)
+    body_mode = modes[0].strip().lower() or "simple"
+    header_mode = (modes[1].strip().lower() if len(modes) > 1 else "simple") or "simple"
+
+    length = None
+    if "l" in tags and tags["l"]:
+        try:
+            length = int(tags["l"])
+        except ValueError:
+            raise ValueError("invalid l tag: %r" % (tags["l"],))
+
+    return {
+        "algorithm": tags["a"].lower(),
+        "domain": tags["d"].lower(),
+        "selector": tags["s"],
+        "length": length,
+        "headers": headers,
+        "canonicalization": canonicalization,
+        "body_mode": body_mode,
+        "header_mode": header_mode,
+        "body_hash": tags["bh"],
+        "signature": tags["b"],
+    }
 
 
 def header_hash(headers, list) -> str:
@@ -85,7 +211,21 @@ def header_hash(headers, list) -> str:
     连续空格或制表符折叠为一个空格，两端空白去掉。把全部条目拼接后计算
     SHA-256 并返回小写十六进制字符串。
     """
-    raise NotImplementedError("header_hash")
+    names = [name.strip().lower() for name in list]
+    if "dkim-signature" in names:
+        raise ValueError("header list must not include dkim-signature")
+
+    consumed = {}
+    out = []
+    for name in names:
+        values = headers.get(name)
+        index = consumed.get(name, 0)
+        if not values or index >= len(values):
+            raise ValueError("missing signed header occurrence: %s" % name)
+        consumed[name] = index + 1
+        value = re.sub(r"[ \t]+", " ", str(values[index])).strip()
+        out.append("%s:%s\r\n" % (name, value))
+    return hashlib.sha256("".join(out).encode("utf-8")).hexdigest()
 
 
 def verify(body, signature, key) -> bool:
@@ -103,7 +243,29 @@ def verify(body, signature, key) -> bool:
     signature["signature"]。缺少字段、类型错误或摘要不匹配时返回 False，
     不要把验签失败变成异常。
     """
-    raise NotImplementedError("verify")
+    try:
+        headers = signature["headers"]
+        header_values = signature["header_values"]
+        body_mode = signature["body_mode"]
+        length = signature["length"]
+        expected_body_hash = signature["body_hash"]
+        expected_header_hash = signature["header_hash"]
+        expected_signature = signature["signature"]
+
+        digest = body_hash(body, body_mode, length)
+        signed_headers = header_hash(header_values, headers)
+        if not hmac.compare_digest(digest, expected_body_hash):
+            return False
+        if not hmac.compare_digest(signed_headers, expected_header_hash):
+            return False
+        mac = hmac.new(
+            _to_bytes(key),
+            (signed_headers + "\n" + digest).encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(mac, expected_signature)
+    except Exception:
+        return False
 
 
 def dkim_batch(messages, policy) -> dict:
@@ -116,4 +278,23 @@ def dkim_batch(messages, policy) -> dict:
     消息复用正文规范化结果或摘要缓存：第二条消息必须使用自己的 body，否
     则两个不同正文会错误共享第一封正文的规范化结果。
     """
-    raise NotImplementedError("dkim_batch")
+    trusted = {str(d).lower() for d in policy.get("trusted_domains", [])}
+    results = {}
+    for message in messages:
+        ok = False
+        try:
+            signature = message["signature"]
+            domain = str(signature.get("domain", "")).lower()
+            if domain in trusted:
+                # 每封邮件都用自己的 body 独立验签，不做任何跨消息缓存。
+                ok = bool(verify(message["body"], signature, message["key"]))
+        except Exception:
+            ok = False
+        results[message.get("id")] = ok
+    passed = sum(1 for ok in results.values() if ok)
+    return {
+        "results": results,
+        "total": len(results),
+        "passed": passed,
+        "failed": len(results) - passed,
+    }
